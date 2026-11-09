@@ -830,6 +830,13 @@ impl KeyEventAction {
                 app.try_submit_current_buffer();
             }
             KeyEventAction::RunFuzzyHistorySearch => {
+                // Edit the query separately; cancellation must preserve the
+                // command, cursor, selection and complete undo history.
+                let query = app.buffer.buffer().to_string();
+                app.fuzzy_history_saved_buffer = Some(std::mem::replace(
+                    &mut app.buffer,
+                    flybuffer::TextBuffer::new(&query),
+                ));
                 if crate::settings().history_backend == crate::settings::HistoryBackend::Flyline {
                     app.long_lived.history_manager.refresh_jsonl_backend();
                 }
@@ -1298,6 +1305,11 @@ impl KeyEventAction {
                     }
                     ContentMode::FuzzyHistorySearch(FuzzyHistorySource::AgentPrompts) => {
                         app.dismissed_agent_mode_buffer = Some(app.buffer.buffer().to_string());
+                    }
+                    ContentMode::FuzzyHistorySearch(FuzzyHistorySource::PastCommands) => {
+                        if let Some(original) = app.fuzzy_history_saved_buffer.take() {
+                            app.buffer = original;
+                        }
                     }
                     _ => {
                         // Not tab completion; just clear the dismissed field.

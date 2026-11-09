@@ -397,6 +397,7 @@ pub(crate) struct App<'a> {
     pub(super) path_warming_subshell: Option<SubshellHandle<shell::PathScanPayload>>,
     pub(super) git_warming_subshell: Option<SubshellHandle<Option<crate::git::GitRepoPayload>>>,
     pub(super) fuzzy_history_session_filter_active: bool,
+    pub(super) fuzzy_history_saved_buffer: Option<flybuffer::TextBuffer>,
     pub(super) vim_state: crate::app::actions::VimState,
     pub(super) vim_history_search: Option<crate::app::actions::VimHistorySearch>,
 }
@@ -549,6 +550,7 @@ impl<'a> App<'a> {
             path_warming_subshell,
             git_warming_subshell,
             fuzzy_history_session_filter_active: false,
+            fuzzy_history_saved_buffer: None,
             vim_state: crate::app::actions::VimState::default(),
             vim_history_search: None,
         };
@@ -1591,11 +1593,14 @@ impl<'a> App<'a> {
             ContentMode::FuzzyHistorySearch(s) => *s,
             _ => return,
         };
-        if let Some(entry) = self
+        let entry = self
             .select_fuzzy_history_manager(&source)
             .accept_fuzzy_search_result()
-            .cloned()
-        {
+            .cloned();
+        if let Some(original) = self.fuzzy_history_saved_buffer.take() {
+            self.buffer = original;
+        }
+        if let Some(entry) = entry {
             let new_command = entry.command.clone();
             self.buffer.replace_buffer(new_command.as_str());
         }
