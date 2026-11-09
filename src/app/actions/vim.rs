@@ -1,5 +1,6 @@
 use crate::app::App;
 use flybuffer::WordDelim;
+use termina::event::KeyEvent;
 
 /// The active mode when Vim keybinding mode is enabled.
 #[derive(
@@ -35,6 +36,7 @@ pub enum VimPendingChar {
 #[derive(Debug, Clone, Default)]
 pub struct VimState {
     pub mode: VimMode,
+    pub repeat: VimRepeat,
     pub pending_operator: Option<VimOperator>,
     pub pending_char_cmd: Option<VimPendingChar>,
     pub pending_text_object: Option<char>, // 'i' (inner) or 'a' (around)
@@ -42,6 +44,43 @@ pub struct VimState {
     pub operator_count: Option<usize>,
     pub last_find: Option<(VimPendingChar, char)>,
     pub yank_register: Option<(String, bool)>, // (text, is_linewise)
+}
+
+/// Record one completed editing command, including an insert-mode continuation.
+/// Motions and cancelled/no-op commands leave the previous change intact.
+#[derive(Debug, Clone, Default)]
+pub struct VimRepeat {
+    pending: Vec<KeyEvent>,
+    last: Vec<KeyEvent>,
+    changed: bool,
+    pub replaying: bool,
+}
+
+impl VimRepeat {
+    pub fn begin(&mut self, key: KeyEvent, normal: bool, pending: bool) {
+        if self.replaying { return; }
+        if normal && !pending {
+            self.pending.clear();
+            self.changed = false;
+        }
+        if normal || !self.pending.is_empty() { self.pending.push(key); }
+    }
+
+    pub fn tracking(&self) -> bool {
+        !self.replaying && !self.pending.is_empty()
+    }
+
+    pub fn finish(&mut self, normal: bool, pending: bool, changed: bool) {
+        if self.replaying { return; }
+        self.changed |= changed;
+        if normal && !pending {
+            if self.changed { self.last = std::mem::take(&mut self.pending); }
+            self.pending.clear();
+            self.changed = false;
+        }
+    }
+
+    pub fn keys(&self) -> Vec<KeyEvent> { self.last.clone() }
 }
 
 impl VimState {
@@ -339,4 +378,44 @@ pub enum VimMotion {
     FindBackward(char),
     TillForward(char),
     TillBackward(char),
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use termina::event::{KeyCode, Modifiers};
+    fn key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), Modifiers::empty()) }
+
+    #[test]
+    fn motion_and_cancel_preserve_last_change() {
+        let mut repeat = VimRepeat::default();
+        repeat.begin(key('x'), true, false);
+        repeat.finish(true, false, true);
+        repeat.begin(key('h'), true, false);
+        repeat.finish(true, false, false);
+        assert_eq!(repeat.keys(), vec![key('x')]);
+        repeat.begin(key('d'), true, false);
+        repeat.finish(true, true, false);
+        repeat.begin(key('q'), true, true);
+        repeat.finish(true, false, false);
+        assert_eq!(repeat.keys(), vec![key('x')]);
+    }
+
+    #[test]
+    fn insert_continuation_finishes_only_on_normal_mode() {
+        let mut repeat = VimRepeat::default();
+        repeat.begin(key('c'), true, false);
+        repeat.finish(true, true, false);
+        repeat.begin(key('w'), true, true);
+        repeat.finish(false, false, true);
+        repeat.begin(key('X'), false, false);
+        repeat.finish(false, false, true);
+        repeat.begin(key('!'), false, false);
+        repeat.finish(true, false, false);
+        assert_eq!(repeat.keys(), vec![key('c'), key('w'), key('X'), key('!')]);
+        repeat.replaying = true;
+        repeat.begin(key('.'), true, false);
+        repeat.finish(true, false, true);
+        assert_eq!(repeat.keys().len(), 4);
+    }
 }

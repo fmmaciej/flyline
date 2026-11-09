@@ -971,6 +971,12 @@ impl KeyEventAction {
                 app.buffer.redo();
             }
             KeyEventAction::InsertChar => {
+                // Unbound Normal/pending/Visual keys must never insert literal text.
+                if crate::settings().vim_mode && app.vim_state.mode != VimMode::Insert {
+                    app.vim_state.clear_pending();
+                    return;
+                }
+
                 if let KeyCode::Char(c) = key.code {
                     // If a non-empty selection is active and the character is a
                     // recognised pairing character, surround the selection with
@@ -1372,7 +1378,21 @@ impl KeyEventAction {
                 app.vim_state.clear_pending();
             }
             KeyEventAction::VimDotRepeat => {
+                let count = app.vim_state.count_accumulator;
+                let mut keys = app.vim_state.repeat.keys();
                 app.vim_state.clear_pending();
+                // A count on dot replaces the saved command's leading count.
+                if let Some(count) = count {
+                    let prefix = keys.iter().take_while(|key| matches!(key.code, KeyCode::Char('0'..='9'))).count();
+                    keys.drain(..prefix);
+                    let mut counted: Vec<KeyEvent> = count.to_string().chars()
+                        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())).collect();
+                    counted.extend(keys);
+                    keys = counted;
+                }
+                app.vim_state.repeat.replaying = true;
+                for key in keys { app.handle_key_event(key); }
+                app.vim_state.repeat.replaying = false;
             }
             KeyEventAction::VimMoveMatchingPair => {
                 app.buffer.move_matching_pair();
@@ -2102,10 +2122,24 @@ impl Binding {
         context: ContextExpr,
         actions: &[KeyEventAction],
     ) -> Self {
+        let vim_binding = context.literals.iter().any(|literal| literal.var.as_str().starts_with("vim"));
         let mut unique_events = Vec::new();
         for event in key_events {
-            if !unique_events.contains(event) {
-                unique_events.push(event.clone());
+            let mut event = event.clone();
+            if vim_binding {
+                if let KeyEventMatch::Exact(ref mut key) = event {
+                    if let KeyCode::Char(c) = key.code {
+                        if c.is_ascii_uppercase() {
+                            key.modifiers |= KeyModifiers::SHIFT;
+                        }
+                    }
+                }
+                if matches!(event, KeyEventMatch::AnyCharAndMods(mods) if mods.is_empty()) {
+                    unique_events.push(KeyEventMatch::AnyCharAndMods(KeyModifiers::SHIFT));
+                }
+            }
+            if !unique_events.contains(&event) {
+                unique_events.push(event);
             }
         }
         Self {
@@ -4953,6 +4987,14 @@ impl App<'_> {
             sequence_number,
         });
 
+        let recording = crate::settings().vim_mode && !self.vim_state.repeat.replaying
+            && matched.as_ref().is_some_and(|(actions, _)| !actions.contains(&KeyEventAction::VimDotRepeat));
+        if recording {
+            let normal = self.vim_state.mode == VimMode::Normal;
+            let pending = self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
+            self.vim_state.repeat.begin(key, normal, pending);
+        }
+        let before_edit = (recording && self.vim_state.repeat.tracking()).then(|| self.buffer.buffer().to_string());
         if let Some((actions, _)) = &matched {
             for action in actions {
                 if !self.mode.is_running() {
@@ -4962,6 +5004,15 @@ impl App<'_> {
                 log::trace!("Matched binding: {}", action.as_str());
                 action.run(self, key);
             }
+        }
+
+        if let Some(before) = before_edit {
+            let excluded = matched.as_ref().is_some_and(|(actions, _)| actions.iter().any(|action|
+                matches!(action, KeyEventAction::Undo | KeyEventAction::Redo | KeyEventAction::PrevHistoryEntry | KeyEventAction::NextHistoryEntry)));
+            let changed = !excluded && before != self.buffer.buffer();
+            let normal = self.vim_state.mode == VimMode::Normal;
+            let pending = self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
+            self.vim_state.repeat.finish(normal, pending, changed);
         }
 
         if matched
@@ -4980,6 +5031,12 @@ impl App<'_> {
             self.leader_key_active_at = None;
         }
 
+        if crate::settings().vim_mode && self.vim_state.mode == VimMode::Normal
+            && self.buffer.cursor_byte_pos() == self.buffer.line_end_pos()
+            && self.buffer.cursor_byte_pos() > self.buffer.line_start_pos()
+        {
+            self.buffer.move_left();
+        }
         self.on_possible_buffer_change();
     }
 }
@@ -4989,6 +5046,21 @@ mod tests {
     use super::super::ContextLiteral;
     use super::*;
     use termina::event::{KeyCode, KeyEvent, Modifiers as KeyModifiers};
+
+    #[test]
+    fn vim_bindings_distinguish_case() {
+        for (lower, upper) in [('a', 'A'), ('d', 'D'), ('w', 'W'), ('i', 'I')] {
+            let lower_binding = get_default_bindings().iter().find(|binding| {
+                binding.context.literals == ContextExpr::from(ContextVar::VimNormalMode).literals
+                    && binding.matches(key(KeyCode::Char(lower)))
+            }).unwrap();
+            let upper_binding = get_default_bindings().iter().find(|binding| {
+                binding.context.literals == ContextExpr::from(ContextVar::VimNormalMode).literals
+                    && binding.matches(key_with_mods(KeyCode::Char(upper), KeyModifiers::SHIFT))
+            }).unwrap();
+            assert_ne!(lower_binding.actions, upper_binding.actions);
+        }
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
