@@ -1,6 +1,11 @@
 use crate::app::App;
 use flybuffer::WordDelim;
-use termina::event::KeyEvent;
+use termina::event::{KeyCode, KeyEvent, Modifiers as KeyModifiers};
+
+pub struct VimHistorySearch {
+    saved_buffer: flybuffer::TextBuffer,
+    forward: bool,
+}
 
 /// The active mode when Vim keybinding mode is enabled.
 #[derive(
@@ -44,6 +49,7 @@ pub struct VimState {
     pub operator_count: Option<usize>,
     pub last_find: Option<(VimPendingChar, char)>,
     pub yank_register: Option<(String, bool)>, // (text, is_linewise)
+    pub last_history_search: Option<(String, bool)>,
 }
 
 /// Record one completed editing command, including an insert-mode continuation.
@@ -58,12 +64,16 @@ pub struct VimRepeat {
 
 impl VimRepeat {
     pub fn begin(&mut self, key: KeyEvent, normal: bool, pending: bool) {
-        if self.replaying { return; }
+        if self.replaying {
+            return;
+        }
         if normal && !pending {
             self.pending.clear();
             self.changed = false;
         }
-        if normal || !self.pending.is_empty() { self.pending.push(key); }
+        if normal || !self.pending.is_empty() {
+            self.pending.push(key);
+        }
     }
 
     pub fn tracking(&self) -> bool {
@@ -71,16 +81,22 @@ impl VimRepeat {
     }
 
     pub fn finish(&mut self, normal: bool, pending: bool, changed: bool) {
-        if self.replaying { return; }
+        if self.replaying {
+            return;
+        }
         self.changed |= changed;
         if normal && !pending {
-            if self.changed { self.last = std::mem::take(&mut self.pending); }
+            if self.changed {
+                self.last = std::mem::take(&mut self.pending);
+            }
             self.pending.clear();
             self.changed = false;
         }
     }
 
-    pub fn keys(&self) -> Vec<KeyEvent> { self.last.clone() }
+    pub fn keys(&self) -> Vec<KeyEvent> {
+        self.last.clone()
+    }
 }
 
 impl VimState {
@@ -91,7 +107,10 @@ impl VimState {
     }
 
     pub fn get_effective_count(&self) -> usize {
-        self.count_accumulator.unwrap_or(1) * self.operator_count.unwrap_or(1)
+        self.count_accumulator
+            .unwrap_or(1)
+            .saturating_mul(self.operator_count.unwrap_or(1))
+            .min(10000)
     }
 
     pub fn reset_counts(&mut self) {
@@ -132,6 +151,113 @@ impl VimState {
 }
 
 impl App<'_> {
+    pub fn start_vim_history_search(&mut self, forward: bool) {
+        self.buffer.end_undo_group();
+        let saved_buffer = std::mem::replace(
+            &mut self.buffer,
+            flybuffer::TextBuffer::new(if forward { "?" } else { "/" }),
+        );
+        self.vim_history_search = Some(VimHistorySearch {
+            saved_buffer,
+            forward,
+        });
+        self.vim_state.clear_pending();
+    }
+
+    /// Search query editing has its own buffer. Cancel restores the entire
+    /// command and undo stack; Enter accepts a match and never submits it.
+    pub fn handle_vim_history_search(&mut self, key: KeyEvent) -> bool {
+        if self.vim_history_search.is_none() {
+            return false;
+        }
+        let cancel = key.code == KeyCode::Escape
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'g' | '[')));
+        if cancel || key.code == KeyCode::Enter {
+            let search = self.vim_history_search.take().unwrap();
+            let query = self.buffer.buffer()[1..].to_string();
+            self.buffer = search.saved_buffer;
+            if !cancel {
+                let query = if query.is_empty() {
+                    self.vim_state
+                        .last_history_search
+                        .as_ref()
+                        .map(|(q, _)| q.clone())
+                        .unwrap_or_default()
+                } else {
+                    query
+                };
+                if !query.is_empty() {
+                    if let Some(entry) = self
+                        .long_lived
+                        .history_manager
+                        .vim_search(&query, search.forward)
+                    {
+                        self.buffer_before_history_navigation
+                            .get_or_insert_with(|| self.buffer.buffer().to_string());
+                        self.buffer.replace_buffer(&entry.command);
+                    }
+                    self.vim_state.last_history_search = Some((query, search.forward));
+                }
+            }
+            self.vim_state.clear_pending();
+            if self.buffer.cursor_byte_pos() == self.buffer.line_end_pos()
+                && self.buffer.cursor_byte_pos() > self.buffer.line_start_pos()
+            {
+                self.buffer.move_left();
+            }
+        } else {
+            match key.code {
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    self.buffer = flybuffer::TextBuffer::new(
+                        if self.vim_history_search.as_ref().unwrap().forward {
+                            "?"
+                        } else {
+                            "/"
+                        },
+                    );
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    self.buffer.insert_char(c)
+                }
+                KeyCode::Backspace if self.buffer.cursor_byte_pos() > 1 => {
+                    self.buffer.delete_left()
+                }
+                KeyCode::Delete if !self.buffer.is_cursor_at_end() => self.buffer.delete_right(),
+                KeyCode::Left if self.buffer.cursor_byte_pos() > 1 => self.buffer.move_left(),
+                KeyCode::Right => self.buffer.move_right(),
+                KeyCode::Home => {
+                    self.buffer.try_move_cursor_to_byte_pos(1, false);
+                }
+                KeyCode::End => self.buffer.move_to_end(),
+                _ => {}
+            }
+        }
+        self.on_possible_buffer_change();
+        true
+    }
+
+    pub fn vim_navigate_history(&mut self, forward: bool) {
+        self.buffer_before_history_navigation
+            .get_or_insert_with(|| self.buffer.buffer().to_string());
+        match self
+            .long_lived
+            .history_manager
+            .vim_navigate(forward, self.vim_state.get_effective_count())
+        {
+            Some(entry) => self.buffer.replace_buffer(&entry.command),
+            None if forward => {
+                if let Some(buffer) = self.buffer_before_history_navigation.take() {
+                    self.buffer.replace_buffer(&buffer);
+                }
+            }
+            None => {}
+        }
+        self.vim_state.clear_pending();
+    }
+
     pub fn vim_mode(&self) -> VimMode {
         self.vim_state.mode
     }
@@ -384,7 +510,9 @@ pub enum VimMotion {
 mod repeat_tests {
     use super::*;
     use termina::event::{KeyCode, Modifiers};
-    fn key(c: char) -> KeyEvent { KeyEvent::new(KeyCode::Char(c), Modifiers::empty()) }
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), Modifiers::empty())
+    }
 
     #[test]
     fn motion_and_cancel_preserve_last_change() {

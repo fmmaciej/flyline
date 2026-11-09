@@ -398,6 +398,7 @@ pub(crate) struct App<'a> {
     pub(super) git_warming_subshell: Option<SubshellHandle<Option<crate::git::GitRepoPayload>>>,
     pub(super) fuzzy_history_session_filter_active: bool,
     pub(super) vim_state: crate::app::actions::VimState,
+    pub(super) vim_history_search: Option<crate::app::actions::VimHistorySearch>,
 }
 
 impl<'a> App<'a> {
@@ -549,6 +550,7 @@ impl<'a> App<'a> {
             git_warming_subshell,
             fuzzy_history_session_filter_active: false,
             vim_state: crate::app::actions::VimState::default(),
+            vim_history_search: None,
         };
 
         app.on_possible_buffer_change();

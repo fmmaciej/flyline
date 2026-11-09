@@ -36,6 +36,8 @@ pub(crate) struct SnapshotManager {
     pub(crate) undos: Vec<Snapshot>,
     pub(crate) redos: Vec<Snapshot>,
     pub(crate) last_snapshot_time: std::time::Instant,
+    explicit_group: bool,
+    group_recorded: bool,
 }
 
 impl TextBuffer {
@@ -44,12 +46,32 @@ impl TextBuffer {
     }
 
     pub(crate) fn push_snapshot(&mut self, merge_with_recent: bool) {
+        if self.undo_redo.explicit_group && self.undo_redo.group_recorded {
+            return;
+        }
         let snapshot = self.create_snapshot();
+        let grouped = self.undo_redo.explicit_group;
+        self.undo_redo
+            .add_snapshot(snapshot, merge_with_recent && !grouped);
+        self.undo_redo.group_recorded |= grouped;
+    }
 
-        self.undo_redo.add_snapshot(snapshot, merge_with_recent);
+    /// Group a modal editing command, independently of typing speed.
+    /// The snapshot is lazy: motions and cancelled operators do not alter undo.
+    pub fn begin_undo_group(&mut self) {
+        if !self.undo_redo.explicit_group {
+            self.undo_redo.explicit_group = true;
+            self.undo_redo.group_recorded = false;
+        }
+    }
+
+    pub fn end_undo_group(&mut self) {
+        self.undo_redo.explicit_group = false;
+        self.undo_redo.group_recorded = false;
     }
 
     pub fn undo(&mut self) {
+        self.end_undo_group();
         let current_state = self.create_snapshot();
 
         if let Some(snapshot) = self.undo_redo.prev_snapshot(current_state) {
@@ -60,6 +82,7 @@ impl TextBuffer {
     }
 
     pub fn redo(&mut self) {
+        self.end_undo_group();
         let current_state = self.create_snapshot();
 
         if let Some(snapshot) = self.undo_redo.next_snapshot(current_state) {
@@ -87,6 +110,8 @@ impl SnapshotManager {
             undos: Vec::new(),
             redos: Vec::new(),
             last_snapshot_time: std::time::Instant::now(),
+            explicit_group: false,
+            group_recorded: false,
         }
     }
 
@@ -151,6 +176,48 @@ impl SnapshotManager {
 mod test_undo_redo {
     use super::*;
     use crate::SubString;
+
+    #[test]
+    fn modal_change_and_insert_are_one_undo_transaction() {
+        let mut tb = TextBuffer::new("one two");
+        tb.move_to_start();
+        tb.begin_undo_group();
+        tb.delete_range(0..3);
+        tb.insert_char('N');
+        tb.insert_char('E');
+        tb.insert_char('W');
+        tb.end_undo_group();
+        assert_eq!(tb.buffer(), "NEW two");
+        tb.undo();
+        assert_eq!(tb.buffer(), "one two");
+        tb.redo();
+        assert_eq!(tb.buffer(), "NEW two");
+    }
+
+    #[test]
+    fn consecutive_modal_changes_and_noop_motions_preserve_boundaries() {
+        let mut tb = TextBuffer::new("ac");
+        tb.move_to_start();
+        tb.begin_undo_group();
+        tb.replace_char_at_cursor('b');
+        tb.end_undo_group();
+        tb.begin_undo_group();
+        tb.move_right();
+        tb.end_undo_group();
+        tb.begin_undo_group();
+        tb.replace_char_at_cursor('d');
+        tb.end_undo_group();
+        assert_eq!(tb.buffer(), "bd");
+        tb.undo();
+        assert_eq!(tb.buffer(), "bc");
+        tb.undo();
+        assert_eq!(tb.buffer(), "ac");
+        tb.begin_undo_group();
+        tb.move_right();
+        tb.end_undo_group();
+        tb.redo();
+        assert_eq!(tb.buffer(), "bc");
+    }
 
     #[test]
     fn undo_stack() {

@@ -700,6 +700,42 @@ impl HistoryManager {
         &self.entries
     }
 
+    /// Vi k/j traverse entries without imposing the current buffer as a prefix.
+    pub fn vim_navigate(&mut self, forward: bool, count: usize) -> Option<HistoryEntry> {
+        self.index = if forward {
+            self.index.saturating_add(count).min(self.entries.len())
+        } else {
+            self.index.saturating_sub(count)
+        };
+        self.last_search_prefix = None;
+        self.last_buffered_command = None;
+        self.entries.get(self.index).cloned()
+    }
+
+    /// Literal vi history search; a leading ^ anchors the match to the start.
+    /// Search relative to the current history position and never wrap or submit.
+    pub fn vim_search(&mut self, query: &str, forward: bool) -> Option<HistoryEntry> {
+        let matches = |entry: &&HistoryEntry| match query.strip_prefix('^') {
+            Some(prefix) => entry.command.starts_with(prefix),
+            None => entry.command.contains(query),
+        };
+        let found = if forward {
+            self.entries[self.index.saturating_add(1).min(self.entries.len())..]
+                .iter()
+                .find(matches)
+        } else {
+            self.entries[..self.index.min(self.entries.len())]
+                .iter()
+                .rev()
+                .find(matches)
+        };
+        let entry = found.cloned()?;
+        self.index = entry.index;
+        self.last_search_prefix = None;
+        self.last_buffered_command = None;
+        Some(entry)
+    }
+
     /// Push a new entry to the in-memory history list.
     /// `self.index` is kept at `entries.len()` (past-the-end), matching the
     /// invariant established by `new()` and `HistoryManager::search_in_history`.
@@ -1720,6 +1756,46 @@ git status
         assert_eq!(
             res3.as_ref().map(|e| e.command.as_str()),
             Some("cargo build")
+        );
+    }
+
+    #[test]
+    fn vim_navigation_counts_entries_and_returns_to_draft() {
+        let mut hm = HistoryManager::default();
+        hm.push_entry("capture older".into());
+        hm.push_entry("capture seeded".into());
+        assert_eq!(hm.vim_navigate(false, 2).unwrap().command, "capture older");
+        assert_eq!(hm.vim_navigate(true, 1).unwrap().command, "capture seeded");
+        assert!(hm.vim_navigate(true, 1).is_none());
+        assert_eq!(hm.vim_navigate(false, 1).unwrap().command, "capture seeded");
+        assert_eq!(
+            hm.vim_navigate(false, usize::MAX).unwrap().command,
+            "capture older"
+        );
+    }
+
+    #[test]
+    fn vim_search_is_literal_relative_anchored_and_does_not_wrap() {
+        let mut hm = HistoryManager::default();
+        hm.push_entry("capture older seeded".into());
+        hm.push_entry("capture seeded".into());
+        assert_eq!(
+            hm.vim_search("seeded", false).unwrap().command,
+            "capture seeded"
+        );
+        assert_eq!(
+            hm.vim_search("seeded", false).unwrap().command,
+            "capture older seeded"
+        );
+        assert!(hm.vim_search("seeded", false).is_none());
+        assert_eq!(
+            hm.vim_search("^capture seed", true).unwrap().command,
+            "capture seeded"
+        );
+        assert!(hm.vim_search("^seeded", false).is_none());
+        assert_eq!(
+            hm.vim_navigate(false, 1).unwrap().command,
+            "capture older seeded"
         );
     }
 

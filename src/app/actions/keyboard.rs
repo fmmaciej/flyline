@@ -248,6 +248,18 @@ pub enum KeyEventAction {
     SetLeaderKey,
     #[strum(message = "Deactivate the leader key state")]
     UnsetLeaderKey,
+    #[strum(message = "Start literal backward vi history search")]
+    VimHistorySearchBackward,
+    #[strum(message = "Start literal forward vi history search")]
+    VimHistorySearchForward,
+    #[strum(message = "Repeat the last vi history search")]
+    VimHistorySearchRepeat,
+    #[strum(message = "Repeat the last vi history search in reverse")]
+    VimHistorySearchRepeatReverse,
+    #[strum(message = "Navigate to the preceding history entry in vi mode")]
+    VimHistoryPrevious,
+    #[strum(message = "Navigate to the next history entry in vi mode")]
+    VimHistoryNext,
     #[strum(message = "Switch to Vim Normal mode")]
     VimEnterNormalMode,
     #[strum(message = "Switch to Vim Insert mode")]
@@ -896,8 +908,21 @@ impl KeyEventAction {
                 app.buffer.delete_right();
             }
             KeyEventAction::MoveLeftStartOfLine => {
-                app.buffer.clear_selection();
-                app.buffer.move_start_of_line();
+                if crate::settings().vim_mode
+                    && matches!(key.code, KeyCode::Char('0'))
+                    && app.vim_state.count_accumulator.is_some()
+                {
+                    app.vim_state.count_accumulator = app
+                        .vim_state
+                        .count_accumulator
+                        .map(|n| n.saturating_mul(10).min(10000));
+                } else {
+                    app.buffer.clear_selection();
+                    app.buffer.move_start_of_line();
+                    if crate::settings().vim_mode {
+                        app.vim_state.reset_counts();
+                    }
+                }
             }
             KeyEventAction::MoveLeftOneWord => {
                 app.buffer.clear_selection();
@@ -908,11 +933,30 @@ impl KeyEventAction {
                 app.buffer.move_one_word_left_fine_grained();
             }
             KeyEventAction::MoveLeft => {
-                app.buffer.move_left();
+                let count = if crate::settings().vim_mode && app.vim_state.mode != VimMode::Insert {
+                    app.vim_state.get_effective_count()
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    if crate::settings().vim_mode
+                        && app.vim_state.mode == VimMode::Normal
+                        && app.buffer.cursor_byte_pos() <= app.buffer.line_start_pos()
+                    {
+                        break;
+                    }
+                    app.buffer.move_left();
+                }
+                if crate::settings().vim_mode {
+                    app.vim_state.reset_counts();
+                }
             }
             KeyEventAction::MoveRightEndOfLine => {
                 app.buffer.clear_selection();
                 app.buffer.move_end_of_line();
+                if crate::settings().vim_mode {
+                    app.vim_state.reset_counts();
+                }
             }
             KeyEventAction::MoveRightOneWord => {
                 app.buffer.clear_selection();
@@ -923,15 +967,51 @@ impl KeyEventAction {
                 app.buffer.move_one_word_right_fine_grained();
             }
             KeyEventAction::MoveRight => {
-                app.buffer.move_right();
+                let count = if crate::settings().vim_mode && app.vim_state.mode != VimMode::Insert {
+                    app.vim_state.get_effective_count()
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    if crate::settings().vim_mode
+                        && app.vim_state.mode == VimMode::Normal
+                        && app.buffer.right_move_pos() >= app.buffer.line_end_pos()
+                    {
+                        break;
+                    }
+                    app.buffer.move_right();
+                }
+                if crate::settings().vim_mode {
+                    app.vim_state.reset_counts();
+                }
             }
             KeyEventAction::MoveLineUp => {
                 app.buffer.clear_selection();
-                app.buffer.move_line_up();
+                let count = if crate::settings().vim_mode && app.vim_state.mode == VimMode::Normal {
+                    app.vim_state.get_effective_count()
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    app.buffer.move_line_up();
+                }
+                if crate::settings().vim_mode {
+                    app.vim_state.reset_counts();
+                }
             }
             KeyEventAction::MoveLineDown => {
                 app.buffer.clear_selection();
-                app.buffer.move_line_down();
+                let count = if crate::settings().vim_mode && app.vim_state.mode == VimMode::Normal {
+                    app.vim_state.get_effective_count()
+                } else {
+                    1
+                };
+                for _ in 0..count {
+                    app.buffer.move_line_down();
+                }
+                if crate::settings().vim_mode {
+                    app.vim_state.reset_counts();
+                }
             }
             KeyEventAction::PrevHistoryEntry => {
                 app.buffer.clear_selection();
@@ -1235,6 +1315,29 @@ impl KeyEventAction {
             KeyEventAction::UnsetLeaderKey => {
                 app.leader_key_active_at = None;
             }
+            KeyEventAction::VimHistorySearchBackward => app.start_vim_history_search(false),
+            KeyEventAction::VimHistorySearchForward => app.start_vim_history_search(true),
+            KeyEventAction::VimHistoryPrevious => app.vim_navigate_history(false),
+            KeyEventAction::VimHistoryNext => app.vim_navigate_history(true),
+            KeyEventAction::VimHistorySearchRepeat
+            | KeyEventAction::VimHistorySearchRepeatReverse => {
+                if let Some((query, forward)) = app.vim_state.last_history_search.clone() {
+                    let forward =
+                        forward ^ matches!(self, KeyEventAction::VimHistorySearchRepeatReverse);
+                    for _ in 0..app.vim_state.get_effective_count() {
+                        if let Some(entry) =
+                            app.long_lived.history_manager.vim_search(&query, forward)
+                        {
+                            app.buffer_before_history_navigation
+                                .get_or_insert_with(|| app.buffer.buffer().to_string());
+                            app.buffer.replace_buffer(&entry.command);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                app.vim_state.clear_pending();
+            }
             KeyEventAction::VimEnterNormalMode => {
                 app.vim_state.enter_normal_mode(&mut app.buffer);
             }
@@ -1383,15 +1486,23 @@ impl KeyEventAction {
                 app.vim_state.clear_pending();
                 // A count on dot replaces the saved command's leading count.
                 if let Some(count) = count {
-                    let prefix = keys.iter().take_while(|key| matches!(key.code, KeyCode::Char('0'..='9'))).count();
+                    let prefix = keys
+                        .iter()
+                        .take_while(|key| matches!(key.code, KeyCode::Char('0'..='9')))
+                        .count();
                     keys.drain(..prefix);
-                    let mut counted: Vec<KeyEvent> = count.to_string().chars()
-                        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())).collect();
+                    let mut counted: Vec<KeyEvent> = count
+                        .to_string()
+                        .chars()
+                        .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+                        .collect();
                     counted.extend(keys);
                     keys = counted;
                 }
                 app.vim_state.repeat.replaying = true;
-                for key in keys { app.handle_key_event(key); }
+                for key in keys {
+                    app.handle_key_event(key);
+                }
                 app.vim_state.repeat.replaying = false;
             }
             KeyEventAction::VimMoveMatchingPair => {
@@ -1454,7 +1565,12 @@ impl KeyEventAction {
                     } else {
                         &mut app.vim_state.count_accumulator
                     };
-                    *acc = Some(acc.unwrap_or(0) * 10 + d as usize);
+                    *acc = Some(
+                        acc.unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add(d as usize)
+                            .min(10000),
+                    );
                 }
             }
             KeyEventAction::VimSetDeleteOperator => {
@@ -2122,7 +2238,10 @@ impl Binding {
         context: ContextExpr,
         actions: &[KeyEventAction],
     ) -> Self {
-        let vim_binding = context.literals.iter().any(|literal| literal.var.as_str().starts_with("vim"));
+        let vim_binding = context
+            .literals
+            .iter()
+            .any(|literal| literal.var.as_str().starts_with("vim"));
         let mut unique_events = Vec::new();
         for event in key_events {
             let mut event = event.clone();
@@ -3409,6 +3528,26 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
         ),
         // --- Vim Normal Mode ---
         Binding::new(
+            &[KC::Char('/').into()],
+            ContextVar::VimNormalMode.into(),
+            &[KeyEventAction::VimHistorySearchBackward],
+        ),
+        Binding::new(
+            &[KC::Char('?').into()],
+            ContextVar::VimNormalMode.into(),
+            &[KeyEventAction::VimHistorySearchForward],
+        ),
+        Binding::new(
+            &[KC::Char('n').into()],
+            ContextVar::VimNormalMode.into(),
+            &[KeyEventAction::VimHistorySearchRepeat],
+        ),
+        Binding::new(
+            &[KC::Char('N').into()],
+            ContextVar::VimNormalMode.into(),
+            &[KeyEventAction::VimHistorySearchRepeatReverse],
+        ),
+        Binding::new(
             &[KC::Char('i').into()],
             ContextVar::VimNormalMode.into(),
             &[KeyEventAction::VimEnterInsertMode],
@@ -3480,13 +3619,23 @@ pub static DEFAULT_BINDINGS: LazyLock<Vec<Binding>> = LazyLock::new(|| {
         ),
         Binding::new(
             &[KC::Char('k').into(), KC::Up.into()],
-            ContextVar::VimNormalMode.into(),
+            ContextVar::VimNormalMode + (!ContextVar::CursorOnFirstLine),
             &[KeyEventAction::MoveLineUp],
         ),
         Binding::new(
+            &[KC::Char('k').into(), KC::Up.into()],
+            ContextVar::VimNormalMode + ContextVar::CursorOnFirstLine,
+            &[KeyEventAction::VimHistoryPrevious],
+        ),
+        Binding::new(
             &[KC::Char('j').into(), KC::Down.into()],
-            ContextVar::VimNormalMode.into(),
+            ContextVar::VimNormalMode + (!ContextVar::CursorOnFinalLine),
             &[KeyEventAction::MoveLineDown],
+        ),
+        Binding::new(
+            &[KC::Char('j').into(), KC::Down.into()],
+            ContextVar::VimNormalMode + ContextVar::CursorOnFinalLine,
+            &[KeyEventAction::VimHistoryNext],
         ),
         Binding::new(
             &[KC::Char('w').into()],
@@ -4937,6 +5086,9 @@ impl App<'_> {
         let raw_key = key;
         let key = apply_remappings(raw_key, &crate::settings().key_remappings);
         log::trace!("Key event after remapping: {:?}", key);
+        if self.handle_vim_history_search(key) {
+            return;
+        }
 
         // Evaluate every context variable once up front, so each variable's
         // condition runs at most once per key press regardless of how many
@@ -4987,14 +5139,23 @@ impl App<'_> {
             sequence_number,
         });
 
-        let recording = crate::settings().vim_mode && !self.vim_state.repeat.replaying
-            && matched.as_ref().is_some_and(|(actions, _)| !actions.contains(&KeyEventAction::VimDotRepeat));
+        let recording = crate::settings().vim_mode
+            && !self.vim_state.repeat.replaying
+            && matched
+                .as_ref()
+                .is_some_and(|(actions, _)| !actions.contains(&KeyEventAction::VimDotRepeat));
         if recording {
             let normal = self.vim_state.mode == VimMode::Normal;
-            let pending = self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
-            self.vim_state.repeat.begin(key, normal, pending);
+            let pending =
+                self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
+            self.vim_state.repeat.begin(raw_key, normal, pending);
         }
-        let before_edit = (recording && self.vim_state.repeat.tracking()).then(|| self.buffer.buffer().to_string());
+        let before_edit = (recording && self.vim_state.repeat.tracking())
+            .then(|| self.buffer.buffer().to_string());
+        if crate::settings().vim_mode {
+            self.buffer.begin_undo_group();
+        }
+
         if let Some((actions, _)) = &matched {
             for action in actions {
                 if !self.mode.is_running() {
@@ -5007,12 +5168,37 @@ impl App<'_> {
         }
 
         if let Some(before) = before_edit {
-            let excluded = matched.as_ref().is_some_and(|(actions, _)| actions.iter().any(|action|
-                matches!(action, KeyEventAction::Undo | KeyEventAction::Redo | KeyEventAction::PrevHistoryEntry | KeyEventAction::NextHistoryEntry)));
+            let excluded = matched.as_ref().is_some_and(|(actions, _)| {
+                actions.iter().any(|action| {
+                    matches!(
+                        action,
+                        KeyEventAction::Undo
+                            | KeyEventAction::Redo
+                            | KeyEventAction::PrevHistoryEntry
+                            | KeyEventAction::NextHistoryEntry
+                            | KeyEventAction::VimHistoryPrevious
+                            | KeyEventAction::VimHistoryNext
+                            | KeyEventAction::VimHistorySearchBackward
+                            | KeyEventAction::VimHistorySearchForward
+                            | KeyEventAction::VimHistorySearchRepeat
+                            | KeyEventAction::VimHistorySearchRepeatReverse
+                    )
+                })
+            });
             let changed = !excluded && before != self.buffer.buffer();
             let normal = self.vim_state.mode == VimMode::Normal;
-            let pending = self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
+            let pending =
+                self.vim_state.has_pending() || self.vim_state.count_accumulator.is_some();
             self.vim_state.repeat.finish(normal, pending, changed);
+        }
+
+        if crate::settings().vim_mode
+            && ((self.vim_state.mode == VimMode::Normal
+                && !self.vim_state.has_pending()
+                && self.vim_state.count_accumulator.is_none())
+                || !self.mode.is_running())
+        {
+            self.buffer.end_undo_group();
         }
 
         if matched
@@ -5031,7 +5217,9 @@ impl App<'_> {
             self.leader_key_active_at = None;
         }
 
-        if crate::settings().vim_mode && self.vim_state.mode == VimMode::Normal
+        if crate::settings().vim_mode
+            && self.vim_history_search.is_none()
+            && self.vim_state.mode == VimMode::Normal
             && self.buffer.cursor_byte_pos() == self.buffer.line_end_pos()
             && self.buffer.cursor_byte_pos() > self.buffer.line_start_pos()
         {
@@ -5050,14 +5238,22 @@ mod tests {
     #[test]
     fn vim_bindings_distinguish_case() {
         for (lower, upper) in [('a', 'A'), ('d', 'D'), ('w', 'W'), ('i', 'I')] {
-            let lower_binding = get_default_bindings().iter().find(|binding| {
-                binding.context.literals == ContextExpr::from(ContextVar::VimNormalMode).literals
-                    && binding.matches(key(KeyCode::Char(lower)))
-            }).unwrap();
-            let upper_binding = get_default_bindings().iter().find(|binding| {
-                binding.context.literals == ContextExpr::from(ContextVar::VimNormalMode).literals
-                    && binding.matches(key_with_mods(KeyCode::Char(upper), KeyModifiers::SHIFT))
-            }).unwrap();
+            let lower_binding = get_default_bindings()
+                .iter()
+                .find(|binding| {
+                    binding.context.literals
+                        == ContextExpr::from(ContextVar::VimNormalMode).literals
+                        && binding.matches(key(KeyCode::Char(lower)))
+                })
+                .unwrap();
+            let upper_binding = get_default_bindings()
+                .iter()
+                .find(|binding| {
+                    binding.context.literals
+                        == ContextExpr::from(ContextVar::VimNormalMode).literals
+                        && binding.matches(key_with_mods(KeyCode::Char(upper), KeyModifiers::SHIFT))
+                })
+                .unwrap();
             assert_ne!(lower_binding.actions, upper_binding.actions);
         }
     }
