@@ -1,0 +1,41 @@
+{
+  "identity": "1.10.0-pr974.aae68bb4.r5",
+  "upstream_base": "ca910967af35579a2d455a071aa939778d8f6171",
+  "pr_head": "aae68bb4acb43d7462bbe4abffedd6e2b10bd889",
+  "code_commit": "27d2f687eec8807f39f81da4969520a2e06305a5",
+  "cargo_lock_sha256": "3162250ee645024bf56933a723a300f1850464d31acbbc0ba156eb80301085e9",
+  "rust_version": "1.99.1",
+  "source_date_epoch": "1794218400",
+  "patches": [
+    {
+      "file": "0001-upstream-pr974.patch",
+      "sha256": "259a30228d5fad952c49afa8f86f0908885684e7b5ac1410e617b71414fb4f50",
+      "commit": "89b83ff44f429c7898d14ca6b1a9aeffe7cc968f"
+    },
+    {
+      "file": "0002-vi-key-dispatch-and-repeat.patch",
+      "sha256": "08daaf5f6c80ec2433c9602b73f56fe837865a3e2412abbbc0794574f5daf389",
+      "commit": "1b7e1bedc8aea346fce10d186b6de8b32b1421d2"
+    },
+    {
+      "file": "0003-vi-transactions-motion-and-history.patch",
+      "sha256": "b0aff662bda12b2c60966057670a58198a613d3bfce998c01d725d871e424493",
+      "commit": "fa4fde56a59c408b3e75e090d08a67aa6c0058a3"
+    },
+    {
+      "file": "0004-current-toolchain-lints.patch",
+      "sha256": "06d31874fd5df3c7c3f0a4e540d2d0f9b4aa8185125a383253d8faefcc93b87a",
+      "commit": "145ae6a31a12143a615fad6e6feb51b6c5058621"
+    },
+    {
+      "file": "0005-restore-bash-input-on-unload.patch",
+      "sha256": "3e86ee0500c6ebab5bf347baefabc128a57ffbe67047830398ada810bc1afcd5",
+      "commit": "02733671a256f646f8899010d0ab3c1a3e4371ed"
+    },
+    {
+      "file": "0006-preserve-native-history-search-buffer.patch",
+      "sha256": "a4043005af495bc31e08ee921c722edac2bf6554b19d90cf7e8dcd7999e5bd84",
+      "commit": "27d2f687eec8807f39f81da4969520a2e06305a5"
+    }
+  ]
+}
