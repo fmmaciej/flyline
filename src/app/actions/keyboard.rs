@@ -2246,12 +2246,11 @@ impl Binding {
         for event in key_events {
             let mut event = event.clone();
             if vim_binding {
-                if let KeyEventMatch::Exact(ref mut key) = event {
-                    if let KeyCode::Char(c) = key.code {
-                        if c.is_ascii_uppercase() {
-                            key.modifiers |= KeyModifiers::SHIFT;
-                        }
-                    }
+                if let KeyEventMatch::Exact(ref mut key) = event
+                    && let KeyCode::Char(c) = key.code
+                    && c.is_ascii_uppercase()
+                {
+                    key.modifiers |= KeyModifiers::SHIFT;
                 }
                 if matches!(event, KeyEventMatch::AnyCharAndMods(mods) if mods.is_empty()) {
                     unique_events.push(KeyEventMatch::AnyCharAndMods(KeyModifiers::SHIFT));

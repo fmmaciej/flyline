@@ -544,7 +544,8 @@ impl TextBuffer {
             None
         };
 
-        let start_pos = if let Some(c) = self.buf[self.cursor_byte..].chars().next() {
+        let start_pos = {
+            let c = self.buf[self.cursor_byte..].chars().next()?;
             if find_pair(c).is_some() {
                 self.cursor_byte
             } else {
@@ -559,8 +560,6 @@ impl TextBuffer {
                         }
                     })?
             }
-        } else {
-            return None;
         };
 
         let c = self.buf[start_pos..].chars().next()?;
@@ -669,7 +668,7 @@ impl TextBuffer {
             return None;
         }
 
-        for window in quote_positions.chunks_exact(2) {
+        for window in quote_positions.as_chunks::<2>().0 {
             let q1 = window[0];
             let q2 = window[1];
             if rel_cursor <= q2 {
