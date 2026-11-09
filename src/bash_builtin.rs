@@ -10,6 +10,69 @@ use crate::{LongLived, SigchldGuard, app, cli, logging, settings};
 // Global state for our custom input stream
 static FLYLINE_INSTANCE_PTR: Mutex<Option<Box<Flyline>>> = Mutex::new(None);
 
+// Bash moves saved inputs between the live input and its stream stack. Keep a
+// value backup, not a pointer to a stack node that may disappear before unload.
+#[cfg(not(feature = "pre_bash_4_4"))]
+struct OriginalInput {
+    stream_type: bash_symbols::StreamType,
+    name: Option<std::ffi::CString>,
+    location: bash_symbols::InputStreamLocation,
+    getter: Option<bash_symbols::ShCGetFunc>,
+    ungetter: Option<bash_symbols::ShCUngetFunc>,
+}
+
+// The raw stream location is opaque Bash-owned data. It is only read/restored
+// from the Bash main thread in the builtin load/unload callbacks.
+#[cfg(not(feature = "pre_bash_4_4"))]
+unsafe impl Send for OriginalInput {}
+
+#[cfg(not(feature = "pre_bash_4_4"))]
+static ORIGINAL_INPUT: Mutex<Option<OriginalInput>> = Mutex::new(None);
+
+#[cfg(not(feature = "pre_bash_4_4"))]
+unsafe fn save_input(input: *const bash_symbols::BashInput) {
+    let input = unsafe { &*input };
+    let name = if input.name.is_null() {
+        None
+    } else {
+        Some(unsafe { std::ffi::CStr::from_ptr(input.name) }.to_owned())
+    };
+    *ORIGINAL_INPUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(OriginalInput {
+        stream_type: input.stream_type,
+        name,
+        // The C union contains no Rust-owned value or destructor.
+        location: unsafe { std::ptr::read(&input.location) },
+        getter: input.getter,
+        ungetter: input.ungetter,
+    });
+}
+
+#[cfg(not(feature = "pre_bash_4_4"))]
+unsafe fn input_is_ours(input: *const bash_symbols::BashInput) -> bool {
+    unsafe { (*input).getter }.is_some_and(|getter| {
+        std::ptr::fn_addr_eq(getter, flyline_get_char as bash_symbols::ShCGetFunc)
+    })
+}
+
+#[cfg(not(feature = "pre_bash_4_4"))]
+unsafe fn restore_input(input: *mut bash_symbols::BashInput, original: OriginalInput) {
+    let input = unsafe { &mut *input };
+    let flyline_name = input.name;
+    input.name = original
+        .name
+        .as_ref()
+        .map_or(std::ptr::null_mut(), |name| unsafe {
+            bash_symbols::locked_xmalloc_cstr(name)
+        });
+    input.stream_type = original.stream_type;
+    input.location = original.location;
+    input.getter = original.getter;
+    input.ungetter = original.ungetter;
+    if !flyline_name.is_null() {
+        unsafe { bash_symbols::locked_xfree(flyline_name.cast()) };
+    }
+}
+
 fn catch_unwind_safe<T>(f: impl FnOnce() -> T) -> Result<T, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
 }
@@ -298,6 +361,10 @@ fn flyline_load_common() -> c_int {
     // with_input_from_stdin will see that the current bash_input is fit for purpose and not add readline stdin.
 
     let setup_bash_input = |bash_input: *mut bash_symbols::BashInput| {
+        #[cfg(not(feature = "pre_bash_4_4"))]
+        unsafe {
+            save_input(bash_input)
+        };
         let old_name = unsafe { (*bash_input).name };
         // Bash expects name to be heap allocated so it can free it later
         let name = c"flyline";
@@ -356,6 +423,7 @@ fn flyline_load_common() -> c_int {
 
             if current_input_name.starts_with("readline") {
                 log::trace!("current bash input is readline, replacing it with flyline input");
+                #[cfg(feature = "pre_bash_4_4")]
                 bash_symbols::push_stream(0);
                 setup_bash_input(&raw mut bash_symbols::bash_input);
                 log::set_max_level(log::LevelFilter::Info);
@@ -430,6 +498,13 @@ fn flyline_load_common() -> c_int {
 #[cfg(not(feature = "pre_bash_4_4"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn flyline_builtin_unload() {
+    if catch_unwind_safe(flyline_unload_common).is_err() {
+        report_stderr_no_panic("flyline: failed to restore Bash input during unload");
+    }
+}
+
+#[cfg(not(feature = "pre_bash_4_4"))]
+fn flyline_unload_common() {
     log::info!("flyline_builtin_unload called, unloading flyline");
 
     bash_funcs::unset_env_var(FLYLINE_ENV_VAR_NAME).unwrap_or_else(|e| {
@@ -440,36 +515,42 @@ pub extern "C" fn flyline_builtin_unload() {
         );
     });
 
-    let had_instance = FLYLINE_INSTANCE_PTR
+    let instance = FLYLINE_INSTANCE_PTR
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .is_some();
-
-    if !had_instance {
+        .take();
+    if instance.is_none() {
         return;
     }
+    let original = ORIGINAL_INPUT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    let Some(original) = original else {
+        return;
+    };
 
     unsafe {
-        if bash_symbols::stream_list.is_null() {
-            log::trace!("stream_list is null, trying to setup readline");
-
-            // we don't have access to yy_readline_(un)get so we can't set it directly
-            // but we can call with_input_from_stdin which will set it up properly
-            bash_symbols::bash_input.stream_type = bash_symbols::StreamType::None;
-            bash_symbols::with_input_from_stdin();
+        if input_is_ours(&raw const bash_symbols::bash_input) {
+            let needs_readline = original.stream_type == bash_symbols::StreamType::None;
+            restore_input(&raw mut bash_symbols::bash_input, original);
+            if needs_readline {
+                bash_symbols::with_input_from_stdin();
+            }
         } else {
-            let head: &mut bash_symbols::StreamSaver = &mut *bash_symbols::stream_list;
-            let current_input_name =
-                std::ffi::CStr::from_ptr(head.bash_input.name).to_string_lossy();
-            log::trace!(
-                "Found stream_list entry with name: {} and type: {:?}",
-                current_input_name,
-                head.bash_input.stream_type
-            );
-            bash_symbols::pop_stream();
+            let mut current = bash_symbols::stream_list;
+            while !current.is_null() {
+                if input_is_ours(&raw const (*current).bash_input) {
+                    restore_input(&raw mut (*current).bash_input, original);
+                    break;
+                }
+                current = (*current).next;
+            }
         }
     }
+    // Never pop Bash's active parser/startup input to restore the editor. Its
+    // saved stdin node may have a null name, and may still be below an rc file.
+    drop(instance);
 }
 
 #[repr(C)]
